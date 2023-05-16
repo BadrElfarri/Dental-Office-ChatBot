@@ -16,6 +16,7 @@
     "url": "https://github.com"
   },
   "dependencies": {
+    "axios": "^1.4.0",
     "botbuilder": "~4.17.0",
     "botbuilder-ai": "^4.17.0",
     "dotenv": "^8.2.0",

@@ -3,23 +3,16 @@
 
 const { ActivityHandler, ActivityTypes } = require("botbuilder");
 const { CustomQuestionAnswering } = require("botbuilder-ai");
+const axios = require("axios");
+const DentistScheduler = require("./dentistscheduler");
+
+const scheduler = new DentistScheduler({
+  SchedulerEndpoint: process.env.ScheduleEndpoint,
+});
 
 class CustomQABot extends ActivityHandler {
   constructor() {
     super();
-
-    try {
-      this.qnaMaker = new CustomQuestionAnswering({
-        knowledgeBaseId: process.env.ProjectName,
-        endpointKey: process.env.LanguageEndpointKey,
-        host: process.env.LanguageEndpointHostName,
-      });
-    } catch (err) {
-      console.warn(
-        `QnAMaker Exception: ${err} Check your QnAMaker configuration in .env`
-      );
-    }
-
     // If a new user is added to the conversation, send them a greeting message
     this.onMembersAdded(async (context, next) => {
       const membersAdded = context.activity.membersAdded;
@@ -35,61 +28,114 @@ class CustomQABot extends ActivityHandler {
         }
       }
 
-      // By calling next() you ensure that the next BotHandler is run.
       await next();
     });
 
-    // When a user sends a message, perform a call to the QnA Maker service to retrieve matching Question and Answer pairs.
+    // When a user sends a message, perform a call to the QnA Maker and LUIS service to retrieve best answer.
     this.onMessage(async (context, next) => {
+      // If environment values are missing return a warning.
       if (
         !process.env.ProjectName ||
-        !process.env.LanguageEndpointKey ||
-        !process.env.LanguageEndpointHostName
+        !process.env.PredictionUrl ||
+        !process.env.RequestId
       ) {
         const unconfiguredQnaMessage =
           "NOTE: \r\n" +
-          "Custom Question Answering is not configured. To enable all capabilities, add `ProjectName`, `LanguageEndpointKey` and `LanguageEndpointHostName` to the .env file. \r\n" +
-          "You may visit https://language.cognitive.azure.com/ to create a Custom Question Answering Project.";
+          "Custom Question Answering is not configured. To enable all capabilities, add `ProjectName`, `PredictionUrl`, `RequestId` and `LanguageEndpointHostName` to the .env file. \r\n" +
+          "You may visit https://language.cognitive.azure.com/ to create a Orchestration Workflow combining a Custom Question Answering and Conversational Language Understanding Projects.";
 
         await context.sendActivity(unconfiguredQnaMessage);
       } else {
         console.log("Calling CQA");
 
-        const enablePreciseAnswer = process.env.EnablePreciseAnswer === "true";
-        const displayPreciseAnswerOnly =
-          process.env.DisplayPreciseAnswerOnly === "true";
-        const response = await this.qnaMaker.getAnswers(context, {
-          enablePreciseAnswer: enablePreciseAnswer,
-        });
-
-        // If an answer was received from CQA, send the answer back to the user.
-        if (response.length > 0) {
-          var activities = [];
-
-          var answerText = response[0].answer;
-
-          // Answer span text has precise answer.
-          var preciseAnswerText = response[0].answerSpan?.text;
-          if (!preciseAnswerText) {
-            activities.push({ type: ActivityTypes.Message, text: answerText });
-          } else {
-            activities.push({
-              type: ActivityTypes.Message,
-              text: preciseAnswerText,
-            });
-
-            if (!displayPreciseAnswerOnly) {
-              // Add answer to the reply when it is configured.
-              activities.push({
-                type: ActivityTypes.Message,
-                text: answerText,
-              });
+        // Construct the request body with the user query
+        const requestBody = {
+          kind: "Conversation",
+          analysisInput: {
+            conversationItem: {
+              id: context.activity.from.id,
+              text: context.activity.text,
+              modality: "text",
+              participantId: context.activity.from.id,
+            },
+          },
+          parameters: {
+            projectName: process.env.ProjectName,
+            verbose: true,
+            deploymentName: "DentalOffice",
+            stringIndexType: "TextElement_V8",
+          },
+        };
+        try {
+          // Make the HTTP POST request to the prediction URL
+          const response = await axios.post(
+            process.env.PredictionUrl,
+            requestBody,
+            {
+              headers: {
+                "Ocp-Apim-Subscription-Key": process.env.LanguageEndpointKey,
+                "Apim-Request-Id": process.env.RequestId,
+                "Content-Type": "application/json",
+              },
             }
+          );
+
+          // console.log(response.data);
+          // Process the response and send the appropriate message back to the user
+          if (
+            (response.data.result.prediction.topIntent === "LUIS") &
+            (response.data.result.prediction.intents.LUIS.confidenceScore >=
+              0.5)
+          ) {
+            if (
+              response.data.result.prediction.intents.LUIS.result.prediction
+                .topIntent === "ScheduleAppointment"
+            ) {
+              // Schedule a time for the patient
+              const entities =
+                response.data.result.prediction.intents.LUIS.result.prediction
+                  .entities;
+              if (entities.length > 0) {
+                const scheduletime = entities.find(
+                  (entity) => entity.category === "time"
+                );
+                const scheduleResult = await scheduler.scheduleAppointment(
+                  scheduletime.text
+                );
+                await context.sendActivity(scheduleResult);
+              } else {
+                await context.sendActivity(
+                  "Could not schedule a time, please provide a time in a form 8am or so"
+                );
+              }
+            } else if (
+              response.data.result.prediction.intents.LUIS.result.prediction
+                .topIntent === "GetAvailability"
+            ) {
+              // Consume the availability endpoint
+              const availability = await scheduler.getAvailability();
+              console.log("Availability:");
+              await context.sendActivity(
+                "The available time slots are: " + availability
+              );
+            }
+          } else if (
+            (response.data.result.prediction.topIntent === "QNA") &
+            (response.data.result.prediction.intents.QNA.confidenceScore >= 0.5)
+          ) {
+            const answer_qna =
+              response.data.result.prediction.intents.QNA.result.answers[0]
+                .answer;
+            console.log("Answer QNA:", answer_qna);
+            await context.sendActivity(answer_qna);
+          } else {
+            await context.sendActivity("No answers was found.");
           }
-          await context.sendActivities(activities);
-          // If no answers were returned from QnA Maker, reply with help.
-        } else {
-          await context.sendActivity("No answers were found.");
+        } catch (error) {
+          console.error("Error:", error);
+          await context.sendActivity(
+            "Failed to fetch an answer. error in communication"
+          );
         }
       }
 
